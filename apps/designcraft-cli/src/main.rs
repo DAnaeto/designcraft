@@ -21,16 +21,42 @@
 //! ```
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// `println!` that ends the program quietly when stdout is closed (`designcraft-cli commands |
-/// head`) instead of panicking with "failed printing to stdout: Broken pipe (os error 32)".
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Print to stdout unless its reader has closed the pipe.
 macro_rules! outln {
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        if let Err(e) = writeln!(std::io::stdout(), $($arg)*) {
+        if !$crate::STDOUT_CLOSED.load(std::sync::atomic::Ordering::Relaxed)
+            && let Err(e) = $crate::stdout_line(format_args!($($arg)*))
+        {
             $crate::stdout_failed(e);
         }
     }};
+}
+
+macro_rules! errln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        if let Err(e) = writeln!(std::io::stderr().lock(), $($arg)*)
+            && e.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            std::process::exit(1);
+        }
+    }};
+}
+
+fn stdout_line(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    let mut stdout = {
+        use std::os::fd::AsFd as _;
+        std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?)
+    };
+    #[cfg(not(unix))]
+    let mut stdout = std::io::stdout();
+    stdout.write_all(format!("{args}\n").as_bytes())
 }
 
 mod automation_args;
@@ -76,23 +102,23 @@ Options:
 Prints {"completed": n, "results": [...]}, plus failedIndex / failedCommand / error and a
 non-zero exit when a step fails."#;
 
-/// The links line under the usage block.
+/// The behavior note and links under the usage block.
 fn usage_footer() -> String {
     format!(
-        "\nCommunity: {}  ·  {}  ·  {}",
+        "\nClosing stdout during run does not cancel work; stop the process to cancel it.\nCommunity: {}  ·  {}  ·  {}",
         designcraft_engine::links::DISCORD,
         designcraft_engine::links::APP_PAGE,
         designcraft_engine::links::GITHUB
     )
 }
 
-/// stdout went away. A reader that stopped early (a closed pipe) ends the program quietly, as
-/// ripgrep does; any other write error is reported.
-fn stdout_failed(e: std::io::Error) -> ! {
+/// A closed pipe suppresses later output; any other write error is reported.
+fn stdout_failed(e: std::io::Error) {
     if e.kind() == std::io::ErrorKind::BrokenPipe {
-        std::process::exit(0);
+        STDOUT_CLOSED.store(true, Ordering::Relaxed);
+        return;
     }
-    eprintln!("designcraft-cli: can't write to stdout: {e}");
+    errln!("designcraft-cli: can't write to stdout: {e}");
     std::process::exit(1);
 }
 
@@ -137,8 +163,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("{USAGE}");
-            eprintln!("{}", usage_footer());
+            errln!("{USAGE}");
+            errln!("{}", usage_footer());
             ExitCode::FAILURE
         }
     }
@@ -148,7 +174,7 @@ fn report(r: Result<(), String>) -> ExitCode {
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("designcraft-cli: {e}");
+            errln!("designcraft-cli: {e}");
             ExitCode::FAILURE
         }
     }
@@ -236,13 +262,13 @@ so drop --connect (or use --connect without the roots)"
             if let Some(roots) = roots {
                 // Every thread of this process, not only the server's: nothing reaches past the roots.
                 file_access::confine_process(roots.clone());
-                eprintln!("designcraft-cli: files confined: {}", roots.describe());
+                errln!("designcraft-cli: files confined: {}", roots.describe());
                 h = h.with_automation_roots(Some(roots));
             }
             Box::new(h)
         }
     };
-    eprintln!("designcraft-cli: MCP server on stdio ({})", backend.describe());
+    errln!("designcraft-cli: MCP server on stdio ({})", backend.describe());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     Server::new(backend).serve(stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
@@ -394,25 +420,25 @@ fn handle_export(s: &mut Session, out: &str, page: usize, scale: f64, pdf_opts: 
             let mut p = pdf_opts.clone();
             p["path"] = json!(out);
             let r = s.execute("file.exportPdf", &p).map_err(|e| e.to_string())?;
-            eprintln!("wrote {out} ({} pages, {} bytes)", r["pages"], r["bytes"]);
+            errln!("wrote {out} ({} pages, {} bytes)", r["pages"], r["bytes"]);
             for w in r["warnings"].as_array().into_iter().flatten() {
-                eprintln!("warning: {}", w.as_str().unwrap_or_default());
+                errln!("warning: {}", w.as_str().unwrap_or_default());
             }
         }
         Export::Document => {
             s.execute("file.saveAs", &json!({"path": out})).map_err(|e| e.to_string())?;
-            eprintln!("saved {out}");
+            errln!("saved {out}");
         }
         Export::Pptx => {
             let r = s.execute("file.exportPptx", &json!({"path": out})).map_err(|e| e.to_string())?;
-            eprintln!("wrote {out} ({} slides, {} bytes)", r["slides"], r["bytes"]);
+            errln!("wrote {out} ({} slides, {} bytes)", r["slides"], r["bytes"]);
             for w in r["warnings"].as_array().into_iter().flatten() {
-                eprintln!("warning: {}", w.as_str().unwrap_or_default());
+                errln!("warning: {}", w.as_str().unwrap_or_default());
             }
         }
         Export::Command(cmd) => {
             let r = s.execute(cmd, &json!({"path": out})).map_err(|e| e.to_string())?;
-            eprintln!("wrote {out} ({} bytes)", r["bytes"]);
+            errln!("wrote {out} ({} bytes)", r["bytes"]);
         }
     }
     Ok(())
@@ -429,7 +455,7 @@ fn export(s: &mut Session, out: &str, page: usize, scale: f64) -> Result<(), Str
     let lower = out.to_lowercase();
     let bytes = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") { img.to_jpeg(90) } else { img.to_png() };
     designcraft_engine::atomic::write_atomic(std::path::Path::new(out), &bytes).map_err(|e| format!("{out}: {e}"))?;
-    eprintln!("wrote {out} ({}×{}, {:.1} ms, {} glyphs)", img.width, img.height, t.elapsed().as_secs_f64() * 1000.0, r.stats.glyphs);
+    errln!("wrote {out} ({}×{}, {:.1} ms, {} glyphs)", img.width, img.height, t.elapsed().as_secs_f64() * 1000.0, r.stats.glyphs);
     Ok(())
 }
 

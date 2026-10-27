@@ -326,7 +326,7 @@ struct Row {
 
 fn row(rows: &mut Vec<Row>, name: impl Into<String>, ms: f64, budget: Option<f64>) {
     let name = name.into();
-    eprintln!("  … {name}: {ms:.2} ms");
+    errln!("  … {name}: {ms:.2} ms");
     rows.push(Row { name, ms, budget });
 }
 
