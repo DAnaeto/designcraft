@@ -178,6 +178,7 @@ fn help_goes_to_stdout_and_unknown_args_to_stderr() {
         assert!(out.status.success(), "{flag}: {:?}", out.status);
         assert!(stdout.starts_with("usage: designcraft-cli"), "{flag}: {stdout:?}");
         assert!(stdout.contains("designcraft-cli --version"), "{flag}: {stdout:?}");
+        assert!(stdout.contains("Closing stdout during run does not cancel work"), "{flag}: {stdout:?}");
         assert!(out.stderr.is_empty(), "{flag} wrote to stderr: {}", String::from_utf8_lossy(&out.stderr));
     }
     // An unknown option is still an error: usage on stderr, nothing on stdout, non-zero exit.
@@ -555,4 +556,109 @@ fn usage_lists_the_automation_root_flags() {
     let out = cli().arg("--help").output().unwrap();
     let usage = String::from_utf8_lossy(&out.stdout);
     assert!(usage.contains("--automation-read-root DIR") && usage.contains("--automation-write-root DIR"), "{usage}");
+}
+
+#[cfg(unix)]
+fn run_with_closed_stdout(args: &[String]) -> std::process::Output {
+    use std::os::fd::OwnedFd;
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let stdout: OwnedFd = writer.into();
+    cli().args(args).stdout(Stdio::from(stdout)).stderr(Stdio::piped()).output().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn run_finishes_and_saves_after_stdout_closes() {
+    let dir = std::env::temp_dir().join(format!("dc-cli-closed-stdout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let doc = dir.join("saved.designcraft");
+    let out = run_with_closed_stdout(&[
+        "run".into(),
+        "--cmd".into(),
+        r#"frame.create={"rect":[72,72,300,200],"content":"text","text":"Saved after pipe closes"}"#.into(),
+        "--cmd".into(),
+        format!("file.save={}", serde_json::json!({"path": doc})),
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(doc.exists(), "the later file.save command must run");
+    let reopened = cli().args(["run", "--in", doc.to_str().unwrap(), "--cmd", "document.inspect"]).output().unwrap();
+    assert!(reopened.status.success(), "{}", String::from_utf8_lossy(&reopened.stderr));
+    let document: serde_json::Value = serde_json::from_slice(&reopened.stdout).unwrap();
+    assert!(document.to_string().contains("Saved after pipe closes"), "{document}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_reports_work_and_save_errors_after_stdout_closes() {
+    let missing = std::env::temp_dir().join(format!("dc-cli-missing-{}", std::process::id())).join("out.designcraft");
+    for command in ["no.such.command".to_string(), format!("file.save={}", serde_json::json!({"path": missing}))] {
+        let out = run_with_closed_stdout(&["run".into(), "--cmd".into(), "document.inspect".into(), "--cmd".into(), command.clone()]);
+        assert_eq!(out.status.code(), Some(1), "{command} must fail without panicking");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected = if command.starts_with("file.save=") { missing.to_str().unwrap() } else { command.as_str() };
+        assert!(stderr.contains(expected), "{command} should report its error: {stderr}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_finishes_after_stdout_and_stderr_share_a_closed_pipe() {
+    use std::os::fd::OwnedFd;
+    let dir = std::env::temp_dir().join(format!("dc-cli-closed-both-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let doc = dir.join("saved.designcraft");
+    let image = dir.join("page.png");
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let stderr: OwnedFd = writer.try_clone().unwrap().into();
+    let stdout: OwnedFd = writer.into();
+    let out = cli()
+        .args([
+            "run".to_string(),
+            "--cmd".into(),
+            r#"frame.create={"rect":[72,72,300,200],"content":"text","text":"Saved after export"}"#.into(),
+            "--export".into(),
+            image.to_string_lossy().into_owned(),
+            "--cmd".into(),
+            format!("file.save={}", serde_json::json!({"path": doc})),
+        ])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "run with closed stdout and stderr failed: {}", out.status);
+    assert!(image.is_file(), "export was skipped");
+    assert!(doc.is_file(), "save after export was skipped");
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let stderr: OwnedFd = writer.try_clone().unwrap().into();
+    let stdout: OwnedFd = writer.into();
+    let failed = cli()
+        .args(["run", "--cmd", "document.inspect", "--cmd", "no.such.command"])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1), "failed work must return failure without panicking");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_reports_stdout_errors_other_than_broken_pipe() {
+    let read_only = std::fs::File::open("/dev/null").unwrap();
+    let out = cli().args(["run", "--cmd", "document.inspect"]).stdout(Stdio::from(read_only)).stderr(Stdio::piped()).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("can't write to stdout"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn run_reports_full_stdout() {
+    let full = std::fs::File::create("/dev/full").unwrap();
+    let out = cli().args(["run", "--cmd", "document.inspect"]).stdout(Stdio::from(full)).stderr(Stdio::piped()).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("can't write to stdout"));
 }
